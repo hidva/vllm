@@ -923,8 +923,6 @@ class DPAsyncMPClient(AsyncMPClient):
     def __init__(self, vllm_config: VllmConfig, executor_class: type[Executor],
                  log_stats: bool):
 
-        self.current_wave = 0
-        self.engines_running = False
         self.reqs_in_flight: dict[str, CoreEngine] = {}
 
         super().__init__(vllm_config, executor_class, log_stats)
@@ -939,22 +937,12 @@ class DPAsyncMPClient(AsyncMPClient):
         ]))[0]
 
     async def add_request_async(self, request: EngineCoreRequest) -> None:
-        request.current_wave = self.current_wave
-
         chosen_engine = self.get_core_engine_for_request()
         self.reqs_in_flight[request.request_id] = chosen_engine
         chosen_engine.num_reqs_in_flight += 1
 
         to_await = self._send_input(EngineCoreRequestType.ADD, request,
                                     chosen_engine)
-        if not self.engines_running:
-            # Send request to chosen engine and dp start loop
-            # control message to all other engines.
-            self.engines_running = True
-            to_await = asyncio.gather(
-                to_await,  # type: ignore[assignment]
-                *self._start_wave_coros(exclude_index=chosen_engine.index))
-
         await to_await
 
         self._ensure_output_queue_task()
@@ -969,32 +957,6 @@ class DPAsyncMPClient(AsyncMPClient):
             for req_id in outputs.finished_requests or ():
                 if engine := self.reqs_in_flight.pop(req_id, None):
                     engine.num_reqs_in_flight -= 1
-
-        if outputs.wave_complete is not None:
-            # Current wave is complete, move to next wave number
-            # and mark engines as paused.
-            if self.current_wave <= outputs.wave_complete:
-                self.current_wave = outputs.wave_complete + 1
-                self.engines_running = False
-
-        elif outputs.start_wave is not None and (
-                outputs.start_wave > self.current_wave or
-            (outputs.start_wave == self.current_wave
-             and not self.engines_running)):
-            # Engine received request for a non-current wave so we must ensure
-            # that other engines progress to the next wave.
-            self.current_wave = outputs.start_wave
-            self.engines_running = True
-            await asyncio.gather(*self._start_wave_coros(
-                exclude_index=outputs.engine_index))
-
-    def _start_wave_coros(self, exclude_index: int) -> list[Awaitable[None]]:
-        logger.debug("Sending start DP wave %d.", self.current_wave)
-        return [
-            self._send_input(EngineCoreRequestType.START_DP_WAVE,
-                             self.current_wave, engine)
-            for engine in self.core_engines if engine.index != exclude_index
-        ]
 
     async def abort_requests_async(self, request_ids: list[str]) -> None:
         if not request_ids:

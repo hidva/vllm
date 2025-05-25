@@ -59,11 +59,6 @@ class EngineCoreRequest(
     lora_request: Optional[LoRARequest]
     cache_salt: Optional[str]
 
-    # Used in DP case to indicate which wave of requests this is expected to
-    # belong to, to cover a race condition where the request is sent before
-    # a wave finished notification is received.
-    current_wave: int = 0
-
 
 class EngineCoreEventType(enum.IntEnum):
     """The type of engine core request event."""
@@ -120,6 +115,13 @@ class UtilityOutput(
         array_like=True,  # type: ignore[call-arg]
         gc=False):  # type: ignore[call-arg]
 
+    # In certain situations, call_id may be None, indicating a lack of
+    # interest in the result.
+    # This kind of output will not trigger serialization or deserialization
+    # operations.
+    # Furthermore, since msgspec only performs checks during decoding, the
+    # type will remain as int
+    # and not be changed to Optional[int].
     call_id: int
 
     # Non-None implies the call failed, result should be None.
@@ -146,13 +148,6 @@ class EngineCoreOutputs(
     utility_output: Optional[UtilityOutput] = None
     finished_requests: Optional[set[str]] = None
 
-    # In DP case, used to signal that the current wave of requests
-    # has finished and the engines are paused.
-    wave_complete: Optional[int] = None
-    # In DP case, used to signal that a request was received for an
-    # "old" wave, so the next wave needs to be started in other engines.
-    start_wave: Optional[int] = None
-
     def __post_init__(self):
         if self.timestamp == 0.0:
             self.timestamp = time.monotonic()
@@ -165,7 +160,6 @@ class EngineCoreRequestType(enum.Enum):
     """
     ADD = b'\x00'
     ABORT = b'\x01'
-    START_DP_WAVE = b'\x02'
     UTILITY = b'\x03'
     # Sentinel used within EngineCoreProc.
     EXECUTOR_FAILED = b'\x04'

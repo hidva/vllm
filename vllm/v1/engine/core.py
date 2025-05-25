@@ -15,7 +15,6 @@ import msgspec
 import zmq
 
 from vllm.config import ParallelConfig, VllmConfig
-from vllm.distributed import stateless_destroy_torch_distributed_process_group
 from vllm.executor.multiproc_worker_utils import _add_prefix
 from vllm.logger import init_logger
 from vllm.logging_utils.dump_input import dump_engine_exception
@@ -29,7 +28,7 @@ from vllm.v1.core.sched.interface import SchedulerInterface
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.core.sched.scheduler import Scheduler as V1Scheduler
 from vllm.v1.engine import (EngineCoreOutputs, EngineCoreRequest,
-                            EngineCoreRequestType, UtilityOutput)
+                            EngineCoreRequestType, UtilityOutput, dpcoord)
 from vllm.v1.engine.mm_input_cache import MirroredProcessingCache
 from vllm.v1.executor.abstract import Executor
 from vllm.v1.kv_cache_interface import KVCacheConfig
@@ -392,7 +391,6 @@ class EngineCoreProc(EngineCore):
 
             self.step_fn = (self.step if self.batch_queue is None else
                             self.step_with_batch_queue)
-            self.engines_running = False
 
             # Send ready message.
             num_gpu_blocks = vllm_config.cache_config.num_gpu_blocks
@@ -506,6 +504,9 @@ class EngineCoreProc(EngineCore):
             if engine_core is not None:
                 engine_core.shutdown()
 
+    def engines_running(self) -> bool:
+        return False
+
     def _init_data_parallel(self, vllm_config: VllmConfig):
         pass
 
@@ -523,7 +524,8 @@ class EngineCoreProc(EngineCore):
         """Exits when an engine step needs to be performed."""
 
         waited = False
-        while not self.engines_running and not (self.scheduler.has_requests()):
+        while not self.engines_running() and not (
+                self.scheduler.has_requests()):
             if logger.isEnabledFor(DEBUG) and self.input_queue.empty():
                 logger.debug("EngineCore waiting for work.")
                 waited = True
@@ -566,6 +568,11 @@ class EngineCoreProc(EngineCore):
                 logger.exception("Invocation of %s method failed", method_name)
                 output.failure_message = (f"Call to {method_name} method"
                                           f" failed: {str(e)}")
+
+            if call_id is None:
+                # Not interested in the result
+                return
+
             self.output_queue.put_nowait(
                 EngineCoreOutputs(utility_output=output))
         elif request_type == EngineCoreRequestType.EXECUTOR_FAILED:
@@ -681,10 +688,6 @@ class DPEngineCoreProc(EngineCoreProc):
         _add_prefix(sys.stdout, process_name, pid)
         _add_prefix(sys.stderr, process_name, pid)
 
-        # Counts forward-passes of the model so that we can synchronize
-        # finished with DP peers every N steps.
-        self.counter = 0
-
         # Initialize the engine.
         dp_rank = vllm_config.parallel_config.data_parallel_rank
         super().__init__(vllm_config, on_head_node, input_address,
@@ -700,6 +703,8 @@ class DPEngineCoreProc(EngineCoreProc):
         assert dp_size > 1
         assert 0 <= local_dp_rank <= dp_rank < dp_size
 
+        self._dppart = dpcoord.Participant(vllm_config, self)
+
         from vllm.platforms import current_platform
         device_control_env_var = current_platform.device_control_env_var
         world_size = vllm_config.parallel_config.world_size
@@ -708,94 +713,22 @@ class DPEngineCoreProc(EngineCoreProc):
             for i in range(local_dp_rank * world_size, (local_dp_rank + 1) *
                            world_size))
 
-        self.dp_rank = dp_rank
-        self.dp_group = vllm_config.parallel_config.stateless_init_dp_group()
-        self.current_wave = 0
+    def _process_engine_step(self):
+        if self.scheduler.has_unfinished_requests():
+            self._dppart.new_step()
+        elif self.engines_running():
+            self._dppart.new_step()
+            self.execute_dummy_batch()
+        super()._process_engine_step()
+        return
 
-    def shutdown(self):
-        super().shutdown()
-        if dp_group := getattr(self, "dp_group", None):
-            stateless_destroy_torch_distributed_process_group(dp_group)
+    def engines_running(self) -> bool:
+        return self._dppart.engines_running()
 
-    def add_request(self, request: EngineCoreRequest):
-        if request.current_wave != self.current_wave:
-            if request.current_wave > self.current_wave:
-                self.current_wave = request.current_wave
-            elif not self.engines_running:
-                # Request received for an already-completed wave, notify
-                # front-end that we need to start the next one.
-                self.output_queue.put_nowait(
-                    EngineCoreOutputs(start_wave=self.current_wave))
+    def _start_step(self, step: int):
+        return self._dppart.core_start_step(step)
 
-        super().add_request(request)
-
-    def _handle_client_request(self, request_type: EngineCoreRequestType,
-                               request: Any) -> None:
-        if request_type == EngineCoreRequestType.START_DP_WAVE:
-            new_wave: int = request
-            if new_wave >= self.current_wave:
-                self.current_wave = new_wave
-                if not self.engines_running:
-                    logger.debug("EngineCore starting idle loop for wave %d.",
-                                 new_wave)
-                    self.engines_running = True
-        else:
-            super()._handle_client_request(request_type, request)
-
-    def run_busy_loop(self):
-        """Core busy loop of the EngineCore for data parallel case."""
-
-        # Loop until process is sent a SIGINT or SIGTERM
-        while True:
-            # 1) Poll the input queue until there is work to do.
-            self._process_input_queue()
-
-            local_unfinished_reqs = self.scheduler.has_unfinished_requests()
-
-            if local_unfinished_reqs:
-                # 2) Step the engine core.
-                self._process_engine_step()
-
-                # Check if we have now finished all requests.
-                local_unfinished_reqs = (
-                    self.scheduler.has_unfinished_requests())
-            else:
-                if self.scheduler.has_finished_requests():
-                    # There are no unfinished requests, but there are some
-                    # finished requests remaining to be removed from the
-                    # batch state. This engine step won't perform a forward
-                    # pass but will flush the finished requests to ensure
-                    # up-to-date state is returned in the engine outputs.
-                    self._process_engine_step()
-
-                if not self.engines_running:
-                    # All engines are idle.
-                    continue
-
-                # There must be unfinished requests in DP peers, run a
-                # dummy forward pass.
-                self.execute_dummy_batch()
-
-            # 3) All-reduce operation to determine global unfinished reqs.
-            self.engines_running = self._has_global_unfinished_reqs(
-                local_unfinished_reqs)
-
-            if not self.engines_running:
-                if self.dp_rank == 0:
-                    # Notify client that we are pausing the loop.
-                    logger.debug("Wave %d finished, pausing engine loop.",
-                                 self.current_wave)
-                    self.output_queue.put_nowait(
-                        EngineCoreOutputs(wave_complete=self.current_wave))
-                self.current_wave += 1
-
-    def _has_global_unfinished_reqs(self, local_unfinished: bool) -> bool:
-
-        # Optimization - only perform finish-sync all-reduce every 24 steps.
-        self.counter += 1
-        if self.counter != 24:
-            return True
-        self.counter = 0
-
-        return ParallelConfig.has_unfinished_dp(self.dp_group,
-                                                local_unfinished)
+    def start_step_threadsafe(self, step: int):
+        req = (None, '_start_step', (step, ))
+        self.input_queue.put_nowait((EngineCoreRequestType.UTILITY, req))
+        return
